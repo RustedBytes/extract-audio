@@ -295,4 +295,234 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BinaryBuilder, Int32Array, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use parquet::arrow::ArrowWriter;
+    use std::fs;
+    use std::sync::Arc;
+    use std::path::{Path, PathBuf};
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    fn sample_batches() -> Vec<RecordBatch> {
+        let path_array: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("audio/sample1.wav"),
+            Some("audio/sample2.wav"),
+        ]));
+        let mut bytes_builder = BinaryBuilder::new();
+        bytes_builder.append_value(&[1u8, 2, 3]);
+        bytes_builder.append_value(&[4u8, 5, 6]);
+        let bytes_array: ArrayRef = Arc::new(bytes_builder.finish());
+        let sampling_rates: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(16_000), Some(22_050)]));
+        let audio_struct: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("path", DataType::Utf8, true)),
+                path_array.clone(),
+            ),
+            (
+                Arc::new(Field::new("bytes", DataType::Binary, true)),
+                bytes_array.clone(),
+            ),
+            (
+                Arc::new(Field::new("sampling_rate", DataType::Int32, true)),
+                sampling_rates.clone(),
+            ),
+        ]));
+        let transcriptions: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("hello world"),
+            Some("goodbye world"),
+        ]));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "audio",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("path", DataType::Utf8, true),
+                    Field::new("bytes", DataType::Binary, true),
+                    Field::new("sampling_rate", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            Field::new("transcription", DataType::Utf8, true),
+        ]));
+
+        vec![RecordBatch::try_new(
+            schema,
+            vec![
+                audio_struct,
+                transcriptions,
+            ],
+        )
+        .expect("failed to construct sample record batch")]
+    }
+
+    fn write_parquet_file(dir: &Path, name: &str, batches: &[RecordBatch]) -> PathBuf {
+        let path = dir.join(name);
+        let file = File::create(&path).expect("failed to create parquet file");
+        let schema = batches[0].schema();
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                .expect("failed to create parquet writer");
+        for batch in batches {
+            writer
+                .write(batch)
+                .expect("failed to write batch to parquet file");
+        }
+        writer.close().expect("failed to close parquet writer");
+        path
+    }
+
+    fn write_arrow_file(dir: &Path, name: &str, batches: &[RecordBatch]) -> PathBuf {
+        let path = dir.join(name);
+        let file = File::create(&path).expect("failed to create arrow file");
+        {
+            let mut writer =
+                StreamWriter::try_new(file, &batches[0].schema()).expect("failed to create writer");
+            for batch in batches {
+                writer.write(batch).expect("failed to write record batch");
+            }
+            writer.finish().expect("failed to finish arrow stream");
+        }
+        path
+    }
+
+    #[test]
+    fn batches_to_parquet_flattens_audio_struct() {
+        let batches = sample_batches();
+        let df = batches_to_parquet(&batches).expect("conversion should succeed");
+        assert_eq!(df.height(), 2);
+
+        let paths = df
+            .column("path")
+            .expect("missing path column")
+            .str()
+            .expect("path column should be utf8");
+        assert_eq!(paths.get(0), Some("audio/sample1.wav"));
+        assert_eq!(paths.get(1), Some("audio/sample2.wav"));
+
+        let bytes = df
+            .column("bytes")
+            .expect("missing bytes column")
+            .binary()
+            .expect("bytes column should be binary");
+        assert_eq!(bytes.get(0), Some(&[1u8, 2, 3][..]));
+        assert_eq!(bytes.get(1), Some(&[4u8, 5, 6][..]));
+    }
+
+    #[test]
+    fn read_parquet_loads_expected_columns() {
+        let batches = sample_batches();
+        let temp_dir = tempdir().expect("failed to create tempdir");
+        let parquet_path = write_parquet_file(temp_dir.path(), "input.parquet", &batches);
+
+        let df = read_parquet(&parquet_path).expect("should read parquet file");
+        assert_eq!(df.height(), 2);
+
+        let transcription = df
+            .column("transcription")
+            .expect("missing transcription column")
+            .str()
+            .expect("transcription column should be utf8");
+        assert_eq!(transcription.get(0), Some("hello world"));
+        assert_eq!(transcription.get(1), Some("goodbye world"));
+    }
+
+    #[test]
+    fn arrow_to_parquet_reads_stream_file() {
+        let batches = sample_batches();
+        let temp_dir = tempdir().expect("failed to create tempdir");
+        let arrow_path = write_arrow_file(temp_dir.path(), "input.arrow", &batches);
+
+        let df = arrow_to_parquet(&arrow_path).expect("should load arrow stream");
+        assert_eq!(df.height(), 2);
+
+        let paths = df
+            .column("path")
+            .expect("missing path column")
+            .str()
+            .expect("path column should be utf8");
+        assert_eq!(paths.get(0), Some("audio/sample1.wav"));
+    }
+
+    #[test]
+    fn process_file_writes_audio_and_metadata() {
+        let batches = sample_batches();
+        let temp_dir = tempdir().expect("failed to create tempdir");
+        let parquet_path = write_parquet_file(temp_dir.path(), "input.parquet", &batches);
+        let output_dir = temp_dir.path().join("out");
+        fs::create_dir(&output_dir).expect("failed to create output dir");
+        let metadata = Mutex::new(Vec::new());
+
+        UNIQUE_FILENAME_COUNTER.store(0, Ordering::SeqCst);
+        let processed =
+            process_file(&parquet_path, Format::Parquet, &output_dir, &metadata)
+                .expect("processing should succeed");
+        assert_eq!(processed, 2);
+
+        let mut written_files: Vec<_> = fs::read_dir(&output_dir)
+            .expect("failed to read output directory")
+            .map(|entry| {
+                entry
+                    .expect("entry error")
+                    .file_name()
+                    .into_string()
+                    .expect("non utf8 file name")
+            })
+            .collect();
+        written_files.sort();
+        assert_eq!(written_files, vec!["sample1.wav", "sample2.wav"]);
+
+        let audio_bytes = fs::read(output_dir.join("sample1.wav")).expect("file missing");
+        assert_eq!(audio_bytes, vec![1, 2, 3]);
+
+        let metadata = metadata.lock().expect("metadata mutex poisoned");
+        assert!(metadata.contains(&(
+            "sample1.wav".to_string(),
+            "hello world".to_string()
+        )));
+        assert!(metadata.contains(&(
+            "sample2.wav".to_string(),
+            "goodbye world".to_string()
+        )));
+    }
+
+    #[test]
+    fn write_file_generates_unique_names_for_conflicts() {
+        let temp_dir = tempdir().expect("failed to create tempdir");
+        let target = temp_dir.path().join("clip.wav");
+        UNIQUE_FILENAME_COUNTER.store(0, Ordering::SeqCst);
+
+        let first = write_file(&target, b"first").expect("initial write should succeed");
+        assert_eq!(first, target);
+
+        let second = write_file(&target, b"second").expect("second write should succeed");
+        assert_ne!(second, target);
+
+        let second_name = second
+            .file_name()
+            .expect("missing file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            second_name.ends_with("clip.wav"),
+            "second path should include original file name"
+        );
+        assert!(
+            second_name.contains('-'),
+            "second path should include timestamp prefix"
+        );
+
+        let content = fs::read(&second).expect("failed to read rewritten file");
+        assert_eq!(content, b"second");
+    }
+}
 static UNIQUE_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);

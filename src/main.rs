@@ -15,6 +15,8 @@ use parquet::file::properties::WriterProperties;
 use polars::prelude::*;
 use rayon::{ThreadPoolBuilder, prelude::*};
 
+static UNIQUE_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Arrow,
@@ -303,13 +305,13 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::ipc::writer::StreamWriter;
     use parquet::arrow::ArrowWriter;
-    use std::fs;
-    use std::sync::Arc;
-    use std::path::{Path, PathBuf};
     use parquet::file::properties::WriterProperties;
+    use std::fs;
     use std::fs::File;
-    use std::sync::atomic::Ordering;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
 
     fn sample_batches() -> Vec<RecordBatch> {
@@ -321,8 +323,7 @@ mod tests {
         bytes_builder.append_value(&[1u8, 2, 3]);
         bytes_builder.append_value(&[4u8, 5, 6]);
         let bytes_array: ArrayRef = Arc::new(bytes_builder.finish());
-        let sampling_rates: ArrayRef =
-            Arc::new(Int32Array::from(vec![Some(16_000), Some(22_050)]));
+        let sampling_rates: ArrayRef = Arc::new(Int32Array::from(vec![Some(16_000), Some(22_050)]));
         let audio_struct: ArrayRef = Arc::new(StructArray::from(vec![
             (
                 Arc::new(Field::new("path", DataType::Utf8, true)),
@@ -355,14 +356,10 @@ mod tests {
             Field::new("transcription", DataType::Utf8, true),
         ]));
 
-        vec![RecordBatch::try_new(
-            schema,
-            vec![
-                audio_struct,
-                transcriptions,
-            ],
-        )
-        .expect("failed to construct sample record batch")]
+        vec![
+            RecordBatch::try_new(schema, vec![audio_struct, transcriptions])
+                .expect("failed to construct sample record batch"),
+        ]
     }
 
     fn write_parquet_file(dir: &Path, name: &str, batches: &[RecordBatch]) -> PathBuf {
@@ -463,9 +460,8 @@ mod tests {
         let metadata = Mutex::new(Vec::new());
 
         UNIQUE_FILENAME_COUNTER.store(0, Ordering::SeqCst);
-        let processed =
-            process_file(&parquet_path, Format::Parquet, &output_dir, &metadata)
-                .expect("processing should succeed");
+        let processed = process_file(&parquet_path, Format::Parquet, &output_dir, &metadata)
+            .expect("processing should succeed");
         assert_eq!(processed, 2);
 
         let mut written_files: Vec<_> = fs::read_dir(&output_dir)
@@ -485,14 +481,8 @@ mod tests {
         assert_eq!(audio_bytes, vec![1, 2, 3]);
 
         let metadata = metadata.lock().expect("metadata mutex poisoned");
-        assert!(metadata.contains(&(
-            "sample1.wav".to_string(),
-            "hello world".to_string()
-        )));
-        assert!(metadata.contains(&(
-            "sample2.wav".to_string(),
-            "goodbye world".to_string()
-        )));
+        assert!(metadata.contains(&("sample1.wav".to_string(), "hello world".to_string())));
+        assert!(metadata.contains(&("sample2.wav".to_string(), "goodbye world".to_string())));
     }
 
     #[test]
@@ -525,4 +515,3 @@ mod tests {
         assert_eq!(content, b"second");
     }
 }
-static UNIQUE_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);

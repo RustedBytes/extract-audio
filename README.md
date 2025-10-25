@@ -1,4 +1,4 @@
-# `extract-audio`
+# extract-audio
 
 `extract-audio` is a command-line utility for quickly unpacking the audio stored in [Hugging Face `datasets`](https://huggingface.co/docs/datasets) parquet or arrow exports. It reads the dataset files, writes each audio clip to disk, and optionally produces a CSV that links the exported files back to their original transcriptions.
 

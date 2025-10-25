@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{self};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use arrow::ipc::reader::StreamReader;
@@ -100,17 +101,31 @@ fn read_parquet(filename: &Path) -> Result<DataFrame> {
     Ok(df)
 }
 
-fn write_file(filename: &Path, data: &[u8]) -> Result<()> {
-    // Skip if the file already exists. Using `Path::try_exists` is slightly more robust.
+fn write_file(filename: &Path, data: &[u8]) -> Result<PathBuf> {
+    // Choose a new filename with timestamp prefix if the target already exists.
+    let mut target = filename.to_path_buf();
     if filename.try_exists()? {
-        return Ok(());
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("System time is before UNIX_EPOCH")?
+            .as_micros();
+        let counter = UNIQUE_FILENAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let original_name = filename
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        let timestamped_name = format!("{timestamp}-{counter:04}-{original_name}");
+        target = if let Some(parent) = filename.parent() {
+            parent.join(&timestamped_name)
+        } else {
+            PathBuf::from(&timestamped_name)
+        };
     }
 
-    // Write the file
-    let mut file = File::create(filename)?;
+    let mut file = File::create(&target)?;
     file.write_all(data)?;
 
-    Ok(())
+    Ok(target)
 }
 
 fn process_file(
@@ -163,9 +178,14 @@ fn process_file(
             );
             let audio_filename = output_dir.join(&audio_filename_str);
             let audio_data: &[u8] = array_series_inner;
-            write_file(&audio_filename, audio_data).expect("Failed to write audio file");
+            let written_path =
+                write_file(&audio_filename, audio_data).expect("Failed to write audio file");
+            let final_name = written_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| written_path.to_string_lossy().into_owned());
 
-            (audio_filename_str, transcription.to_string())
+            (final_name, transcription.to_string())
         })
         .collect();
 
@@ -275,3 +295,4 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+static UNIQUE_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);

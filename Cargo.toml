@@ -9,7 +9,7 @@ clap = { version = "4.5.50", features = ["derive"] }
 polars = { version = "0.51.0", features = ["full"] }
 
 parquet = { version = "56" }
-arrow = { version = "56" }
+arrow = { version = "57" }
 
 tempfile = "3"
 

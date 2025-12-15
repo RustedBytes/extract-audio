@@ -35,7 +35,7 @@ jobs:
       run: cargo install extract-audio --target aarch64-pc-windows-msvc --git https://github.com/egorsmkv/extract-audio
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v6
       with:
         name: extract-audio_aarch64_msvc_windows.exe
         path: C:\Users\runneradmin\.cargo\bin\extract-audio.exe

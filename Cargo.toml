@@ -1,12 +1,12 @@
 [package]
 name = "extract-audio"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.57", features = ["derive"] }
 
-polars = { version = "0.52.0", features = ["full"] }
+polars = { version = "0.53.0", features = ["full"] }
 
 parquet = { version = "57" }
 arrow = { version = "57" }
@@ -14,7 +14,7 @@ arrow = { version = "57" }
 tempfile = "3"
 
 rayon = { version = "1.11.0" }
-anyhow = "1.0.100"
+anyhow = "1.0.101"
 csv = "1.4.0"
 
 [profile.release]

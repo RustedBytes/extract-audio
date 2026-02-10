@@ -85,7 +85,7 @@ fn batches_to_parquet(batches: &[RecordBatch]) -> Result<DataFrame> {
     let df = ParquetReader::new(tmp_file)
         .with_columns(Some(vec!["audio".to_string(), "transcription".to_string()]))
         .finish()?
-        .unnest(["audio"])?;
+        .unnest(["audio"], None)?;
 
     Ok(df)
 }
@@ -98,7 +98,7 @@ fn read_parquet(filename: &Path) -> Result<DataFrame> {
         .with_columns(Some(vec!["audio".to_string(), "transcription".to_string()]))
         .finish()
         .context("Failed to read parquet file into DataFrame")?
-        .unnest(["audio"])?;
+        .unnest(["audio"], None)?;
 
     Ok(df)
 }
@@ -272,16 +272,20 @@ fn main() -> Result<()> {
         println!("Writing metadata to {}...", metadata_file_path.display());
         let records = metadata_records.into_inner().unwrap();
         if !records.is_empty() {
-            let mut df = DataFrame::new(vec![
-                Column::new(
-                    "file_name".into(),
-                    records.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
-                ),
-                Column::new(
-                    "transcription".into(),
-                    records.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
-                ),
-            ])?;
+            let height = records.len();
+            let mut df = DataFrame::new(
+                height,
+                vec![
+                    Column::new(
+                        "file_name".into(),
+                        records.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+                    ),
+                    Column::new(
+                        "transcription".into(),
+                        records.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+                    ),
+                ],
+            )?;
 
             let mut file = File::create(&metadata_file_path).with_context(|| {
                 format!(

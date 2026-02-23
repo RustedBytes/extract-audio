@@ -14,7 +14,7 @@ arrow = { version = "57" }
 tempfile = "3"
 
 rayon = { version = "1.11.0" }
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 csv = "1.4.0"
 
 [profile.release]

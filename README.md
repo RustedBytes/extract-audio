@@ -94,25 +94,6 @@ extract-audio \
 
 The metadata CSV contains `file_name`, `audio_column`, `id`, and `transcription`. The `id` and `transcription` fields are blank when the dataset does not provide those columns.
 
-## Development
-
-The project includes tooling for producing multi-architecture binaries using [`cross`](https://github.com/cross-rs/cross), [`podman`](https://podman.io/), and [`goreleaser`](https://goreleaser.com/). To reproduce the release builds:
-
-1. Build the container images and configure podman resources:
-
-    ```bash
-    podman build --platform=linux/amd64 -f dockerfiles/Dockerfile.aarch64-unknown-linux-gnu -t aarch64-unknown-linux-gnu:my-edge .
-    podman build --platform=linux/amd64 -f dockerfiles/Dockerfile.x86_64-unknown-linux-gnu -t x86_64-unknown-linux-gnu:my-edge .
-
-    podman machine set --cpus 4 --memory 8192
-    ```
-
-2. Produce the binaries with goreleaser:
-
-    ```bash
-    goreleaser build --clean --snapshot --id extract-audio --timeout 60m
-    ```
-
 ## License
 
 This project is distributed under the terms of the MIT license.

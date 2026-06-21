@@ -1,6 +1,6 @@
 # extract-audio
 
-`extract-audio` is a command-line utility for quickly unpacking the audio stored in [Hugging Face `datasets`](https://huggingface.co/docs/datasets) parquet or arrow exports. It reads the dataset files, writes each audio clip to disk, and optionally produces a CSV that links the exported files back to their original transcriptions.
+`extract-audio` is a command-line utility for quickly unpacking the audio stored in [Hugging Face `datasets`](https://huggingface.co/docs/datasets) parquet or arrow exports. It reads the dataset files, writes each audio clip to disk, and optionally produces a CSV that links the exported files back to their source columns, IDs, and transcriptions when present.
 
 ## Table of contents
 
@@ -18,9 +18,10 @@
 
 - Supports both Apache Arrow (`.arrow`) and Parquet (`.parquet`) files produced by Hugging Face `datasets`.
 - Processes either a single file or an entire directory of dataset shards.
-- Extracts the audio bytes in parallel using Rayon for fast throughput.
+- Extracts audio bytes in parallel using Rayon for fast throughput.
+- Supports datasets with one or more Hugging Face audio columns, such as `audio`, `clean`, and `noisy`.
 - Preserves the original file names from the dataset metadata when writing audio files.
-- Generates an optional CSV with the audio file name and transcription for downstream processing.
+- Generates an optional CSV with the audio file name, source audio column, dataset ID, and transcription for downstream processing.
 
 ## Requirements
 
@@ -61,12 +62,14 @@ Options:
       --format <FORMAT>                File format [default: parquet] [possible values: arrow, parquet]
       --output <OUTPUT>                The path to the output files
       --threads <THREADS>              Number of threads to use for processing [default: 3]
-      --metadata-file <METADATA_FILE>  CSV file where transcriptions should be written
+      --metadata-file <METADATA_FILE>  CSV file where extracted audio metadata should be written
   -h, --help                           Print help
   -V, --version                        Print version
 ```
 
-The command inspects either the `audio` column of the Parquet file or the nested structures inside the Arrow stream and writes each item in the `bytes` field to disk. Files are skipped if they already exist, allowing interrupted runs to be resumed.
+The command scans for Hugging Face audio feature columns, which are struct columns containing a `bytes` field and usually a `path` field. It supports the common single-column layout, such as `audio`, and paired audio-to-audio layouts, such as `clean` and `noisy`.
+
+When there is one `audio` column, output names preserve the original audio file names. When there are multiple audio columns, or a single non-`audio` column, the output name is prefixed with the source column name, for example `clean_p226_001.wav` and `noisy_p226_001.wav`. If the dataset has no audio path, the command falls back to the row `id`, then to a generated row name, and infers a common extension from the audio bytes when possible.
 
 ### Examples
 
@@ -80,7 +83,7 @@ extract-audio --format arrow --input data/data-00000-of-01189.arrow --output ext
 
 ### Metadata CSV
 
-Passing the `--metadata-file` flag writes a CSV with two columns: `file_name` and `transcription`. This is useful if you need to align the exported audio files with text for downstream training or evaluation.
+Passing the `--metadata-file` flag writes a CSV that can be used to align the exported audio files with their source columns, dataset IDs, and text for downstream training or evaluation.
 
 ```bash
 extract-audio \
@@ -88,6 +91,8 @@ extract-audio \
   --output audio/ \
   --metadata-file transcripts.csv
 ```
+
+The metadata CSV contains `file_name`, `audio_column`, `id`, and `transcription`. The `id` and `transcription` fields are blank when the dataset does not provide those columns.
 
 ## Development
 

@@ -17,6 +17,23 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 
 static UNIQUE_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug)]
+struct MetadataRecord {
+    file_name: String,
+    audio_column: String,
+    id: Option<String>,
+    transcription: Option<String>,
+}
+
+struct AudioRecord<'a> {
+    audio_column: String,
+    path: Option<String>,
+    id: Option<String>,
+    transcription: Option<String>,
+    row_index: usize,
+    bytes: &'a [u8],
+}
+
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Arrow,
@@ -47,7 +64,7 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     threads: usize,
 
-    /// CSV file where transcriptions should be written
+    /// CSV file where extracted audio metadata should be written
     #[arg(long, action = ArgAction::Set)]
     metadata_file: Option<PathBuf>,
 }
@@ -81,11 +98,7 @@ fn batches_to_parquet(batches: &[RecordBatch]) -> Result<DataFrame> {
 
     let tmp_file = writer.into_inner()?;
 
-    // Read in parquet file and unnest the audio column
-    let df = ParquetReader::new(tmp_file)
-        .with_columns(Some(vec!["audio".to_string(), "transcription".to_string()]))
-        .finish()?
-        .unnest(["audio"], None)?;
+    let df = ParquetReader::new(tmp_file).finish()?;
 
     Ok(df)
 }
@@ -95,10 +108,8 @@ fn read_parquet(filename: &Path) -> Result<DataFrame> {
         .with_context(|| format!("Failed to open parquet file: {}", filename.display()))?;
 
     let df = ParquetReader::new(file)
-        .with_columns(Some(vec!["audio".to_string(), "transcription".to_string()]))
         .finish()
-        .context("Failed to read parquet file into DataFrame")?
-        .unnest(["audio"], None)?;
+        .context("Failed to read parquet file into DataFrame")?;
 
     Ok(df)
 }
@@ -130,11 +141,93 @@ fn write_file(filename: &Path, data: &[u8]) -> Result<PathBuf> {
     Ok(target)
 }
 
+fn audio_column_names(df: &DataFrame) -> Vec<String> {
+    df.columns()
+        .iter()
+        .filter(|column| {
+            column
+                .struct_()
+                .is_ok_and(|audio_struct| audio_struct.field_by_name("bytes").is_ok())
+        })
+        .map(|column| column.name().to_string())
+        .collect()
+}
+
+fn infer_audio_extension(data: &[u8]) -> &'static str {
+    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+        "wav"
+    } else if data.starts_with(b"fLaC") {
+        "flac"
+    } else if data.starts_with(b"OggS") {
+        "ogg"
+    } else if data.starts_with(b"ID3")
+        || data
+            .get(0..2)
+            .is_some_and(|header| header[0] == 0xff && header[1] & 0xe0 == 0xe0)
+    {
+        "mp3"
+    } else if data
+        .get(4..12)
+        .is_some_and(|brand| brand.starts_with(b"ftyp"))
+    {
+        "m4a"
+    } else {
+        "audio"
+    }
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "audio".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn output_file_name(
+    audio_column: &str,
+    path: Option<&str>,
+    id: Option<&str>,
+    row_index: usize,
+    bytes: &[u8],
+    prefix_audio_column: bool,
+) -> String {
+    let fallback = format!("row-{row_index:06}");
+    let raw_name = path
+        .filter(|path| !path.is_empty())
+        .and_then(|path| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .or(id.filter(|id| !id.is_empty()))
+        .unwrap_or(&fallback);
+
+    let mut file_name = sanitize_filename_component(raw_name);
+    if Path::new(&file_name).extension().is_none() {
+        file_name = format!("{}.{}", file_name, infer_audio_extension(bytes));
+    }
+
+    if prefix_audio_column {
+        format!(
+            "{}_{}",
+            sanitize_filename_component(audio_column),
+            file_name
+        )
+    } else {
+        file_name
+    }
+}
+
 fn process_file(
     filename: &Path,
     format: Format,
     output_dir: &Path,
-    metadata_records: &Mutex<Vec<(String, String)>>,
+    metadata_records: &Mutex<Vec<MetadataRecord>>,
 ) -> Result<usize> {
     // Convert the file to a DataFrame
     let df = match format {
@@ -144,56 +237,84 @@ fn process_file(
             .with_context(|| format!("Error processing parquet file {}", filename.display()))?,
     };
 
-    // Extract the series from the DataFrame
-    let path_series = df.column("path")?.str()?;
-    let array_series = df.column("bytes")?.binary()?;
-    let transcription_series = df.column("transcription")?.str()?;
+    let audio_columns = audio_column_names(&df);
+    if audio_columns.is_empty() {
+        anyhow::bail!(
+            "No Hugging Face audio columns found in {}. Expected a struct column with a bytes field.",
+            filename.display()
+        );
+    }
 
-    let num_rows = df.height();
+    let id_series = df.column("id").ok().and_then(|column| column.str().ok());
+    let transcription_series = df
+        .column("transcription")
+        .ok()
+        .and_then(|column| column.str().ok());
+    let prefix_audio_column = audio_columns.len() > 1 || audio_columns[0] != "audio";
 
-    let records: Vec<_> = (0..num_rows)
-        .into_par_iter()
-        .filter_map(|i| {
-            if let (Some(path_val), Some(transcription), Some(array_series_inner)) = (
-                path_series.get(i),
-                transcription_series.get(i),
-                array_series.get(i),
-            ) {
-                Some((path_val, transcription, array_series_inner))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut total_audio_records = 0;
+    let mut all_metadata = Vec::new();
 
-    let local_metadata: Vec<(String, String)> = records
-        .par_iter()
-        .map(|(path_val, transcription, array_series_inner)| {
-            let original_path = Path::new(path_val);
-            let file_stem = original_path.file_stem().unwrap_or_default();
-            let extension = original_path.extension().unwrap_or_default();
+    for audio_column in audio_columns {
+        let audio_struct = df.column(&audio_column)?.struct_()?;
+        let bytes_field = audio_struct.field_by_name("bytes")?;
+        let bytes_series = bytes_field.binary()?;
+        let path_field = audio_struct.field_by_name("path").ok();
+        let path_series = path_field.as_ref().and_then(|series| series.str().ok());
 
-            let audio_filename_str = format!(
-                "{}.{}",
-                file_stem.to_string_lossy(),
-                extension.to_string_lossy()
-            );
-            let audio_filename = output_dir.join(&audio_filename_str);
-            let audio_data: &[u8] = array_series_inner;
-            let written_path =
-                write_file(&audio_filename, audio_data).expect("Failed to write audio file");
-            let final_name = written_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| written_path.to_string_lossy().into_owned());
+        let records: Vec<_> = (0..df.height())
+            .filter_map(|row_index| {
+                bytes_series.get(row_index).map(|bytes| AudioRecord {
+                    audio_column: audio_column.clone(),
+                    path: path_series
+                        .and_then(|series| series.get(row_index))
+                        .map(ToString::to_string),
+                    id: id_series
+                        .and_then(|series| series.get(row_index))
+                        .map(ToString::to_string),
+                    transcription: transcription_series
+                        .and_then(|series| series.get(row_index))
+                        .map(ToString::to_string),
+                    row_index,
+                    bytes,
+                })
+            })
+            .collect();
 
-            (final_name, transcription.to_string())
-        })
-        .collect();
+        total_audio_records += records.len();
 
-    metadata_records.lock().unwrap().extend(local_metadata);
+        let local_metadata: Result<Vec<_>> = records
+            .par_iter()
+            .map(|record| {
+                let audio_filename = output_dir.join(output_file_name(
+                    &record.audio_column,
+                    record.path.as_deref(),
+                    record.id.as_deref(),
+                    record.row_index,
+                    record.bytes,
+                    prefix_audio_column,
+                ));
+                let written_path = write_file(&audio_filename, record.bytes)?;
+                let final_name = written_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| written_path.to_string_lossy().into_owned());
 
-    Ok(num_rows)
+                Ok(MetadataRecord {
+                    file_name: final_name,
+                    audio_column: record.audio_column.clone(),
+                    id: record.id.clone(),
+                    transcription: record.transcription.clone(),
+                })
+            })
+            .collect();
+
+        all_metadata.extend(local_metadata?);
+    }
+
+    metadata_records.lock().unwrap().extend(all_metadata);
+
+    Ok(total_audio_records)
 }
 
 fn main() -> Result<()> {
@@ -226,7 +347,7 @@ fn main() -> Result<()> {
         }
         println!("Processing file: {}...", input_file.display());
         let rows = process_file(&input_file, args.format, &args.output, &metadata_records)?;
-        println!("Total number of rows processed: {}", rows);
+        println!("Total number of audio clips processed: {}", rows);
     }
 
     if let Some(input_dir) = args.input_dir {
@@ -263,7 +384,7 @@ fn main() -> Result<()> {
         });
 
         println!(
-            "Total number of rows processed: {}",
+            "Total number of audio clips processed: {}",
             total_rows.load(Ordering::SeqCst)
         );
     }
@@ -278,11 +399,31 @@ fn main() -> Result<()> {
                 vec![
                     Column::new(
                         "file_name".into(),
-                        records.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+                        records
+                            .iter()
+                            .map(|record| record.file_name.as_str())
+                            .collect::<Vec<_>>(),
+                    ),
+                    Column::new(
+                        "audio_column".into(),
+                        records
+                            .iter()
+                            .map(|record| record.audio_column.as_str())
+                            .collect::<Vec<_>>(),
+                    ),
+                    Column::new(
+                        "id".into(),
+                        records
+                            .iter()
+                            .map(|record| record.id.as_deref())
+                            .collect::<Vec<_>>(),
                     ),
                     Column::new(
                         "transcription".into(),
-                        records.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+                        records
+                            .iter()
+                            .map(|record| record.transcription.as_deref())
+                            .collect::<Vec<_>>(),
                     ),
                 ],
             )?;
@@ -366,6 +507,59 @@ mod tests {
         ]
     }
 
+    fn audio_struct_array(paths: Vec<Option<&str>>, byte_values: Vec<&[u8]>) -> ArrayRef {
+        let path_array: ArrayRef = Arc::new(StringArray::from(paths));
+        let mut bytes_builder = BinaryBuilder::new();
+        for value in byte_values {
+            bytes_builder.append_value(value);
+        }
+        let bytes_array: ArrayRef = Arc::new(bytes_builder.finish());
+        let sampling_rates: ArrayRef = Arc::new(Int32Array::from(vec![Some(16_000), Some(16_000)]));
+
+        Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("path", DataType::Utf8, true)),
+                path_array,
+            ),
+            (
+                Arc::new(Field::new("bytes", DataType::Binary, true)),
+                bytes_array,
+            ),
+            (
+                Arc::new(Field::new("sampling_rate", DataType::Int32, true)),
+                sampling_rates,
+            ),
+        ]))
+    }
+
+    fn voicebank_like_batches() -> Vec<RecordBatch> {
+        let ids: ArrayRef = Arc::new(StringArray::from(vec![Some("p226_001"), Some("p226_002")]));
+        let clean = audio_struct_array(
+            vec![None, None],
+            vec![b"RIFF0000WAVEclean-one", b"RIFF0000WAVEclean-two"],
+        );
+        let noisy = audio_struct_array(
+            vec![None, None],
+            vec![b"RIFF0000WAVEnoisy-one", b"RIFF0000WAVEnoisy-two"],
+        );
+
+        let audio_type = DataType::Struct(Fields::from(vec![
+            Field::new("path", DataType::Utf8, true),
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("sampling_rate", DataType::Int32, true),
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("clean", audio_type.clone(), true),
+            Field::new("noisy", audio_type, true),
+        ]));
+
+        vec![
+            RecordBatch::try_new(schema, vec![ids, clean, noisy])
+                .expect("failed to construct voicebank-like record batch"),
+        ]
+    }
+
     fn write_parquet_file(dir: &Path, name: &str, batches: &[RecordBatch]) -> PathBuf {
         let path = dir.join(name);
         let file = File::create(&path).expect("failed to create parquet file");
@@ -397,24 +591,23 @@ mod tests {
     }
 
     #[test]
-    fn batches_to_parquet_flattens_audio_struct() {
+    fn batches_to_parquet_preserves_audio_struct() {
         let batches = sample_batches();
         let df = batches_to_parquet(&batches).expect("conversion should succeed");
         assert_eq!(df.height(), 2);
 
-        let paths = df
-            .column("path")
-            .expect("missing path column")
-            .str()
-            .expect("path column should be utf8");
+        let audio = df
+            .column("audio")
+            .expect("missing audio column")
+            .struct_()
+            .expect("audio column should be a struct");
+        let path_field = audio.field_by_name("path").expect("missing path field");
+        let paths = path_field.str().expect("path field should be utf8");
         assert_eq!(paths.get(0), Some("audio/sample1.wav"));
         assert_eq!(paths.get(1), Some("audio/sample2.wav"));
 
-        let bytes = df
-            .column("bytes")
-            .expect("missing bytes column")
-            .binary()
-            .expect("bytes column should be binary");
+        let bytes_field = audio.field_by_name("bytes").expect("missing bytes field");
+        let bytes = bytes_field.binary().expect("bytes field should be binary");
         assert_eq!(bytes.get(0), Some(&[1u8, 2, 3][..]));
         assert_eq!(bytes.get(1), Some(&[4u8, 5, 6][..]));
     }
@@ -446,11 +639,13 @@ mod tests {
         let df = arrow_to_parquet(&arrow_path).expect("should load arrow stream");
         assert_eq!(df.height(), 2);
 
-        let paths = df
-            .column("path")
-            .expect("missing path column")
-            .str()
-            .expect("path column should be utf8");
+        let audio = df
+            .column("audio")
+            .expect("missing audio column")
+            .struct_()
+            .expect("audio column should be a struct");
+        let path_field = audio.field_by_name("path").expect("missing path field");
+        let paths = path_field.str().expect("path field should be utf8");
         assert_eq!(paths.get(0), Some("audio/sample1.wav"));
     }
 
@@ -485,8 +680,63 @@ mod tests {
         assert_eq!(audio_bytes, vec![1, 2, 3]);
 
         let metadata = metadata.lock().expect("metadata mutex poisoned");
-        assert!(metadata.contains(&("sample1.wav".to_string(), "hello world".to_string())));
-        assert!(metadata.contains(&("sample2.wav".to_string(), "goodbye world".to_string())));
+        assert!(metadata.iter().any(|record| {
+            record.file_name == "sample1.wav"
+                && record.audio_column == "audio"
+                && record.transcription.as_deref() == Some("hello world")
+        }));
+        assert!(metadata.iter().any(|record| {
+            record.file_name == "sample2.wav"
+                && record.audio_column == "audio"
+                && record.transcription.as_deref() == Some("goodbye world")
+        }));
+    }
+
+    #[test]
+    fn process_file_writes_multiple_audio_columns_without_transcription() {
+        let batches = voicebank_like_batches();
+        let temp_dir = tempdir().expect("failed to create tempdir");
+        let parquet_path = write_parquet_file(temp_dir.path(), "voicebank.parquet", &batches);
+        let output_dir = temp_dir.path().join("out");
+        fs::create_dir(&output_dir).expect("failed to create output dir");
+        let metadata = Mutex::new(Vec::new());
+
+        UNIQUE_FILENAME_COUNTER.store(0, Ordering::SeqCst);
+        let processed = process_file(&parquet_path, Format::Parquet, &output_dir, &metadata)
+            .expect("processing should succeed");
+        assert_eq!(processed, 4);
+
+        let mut written_files: Vec<_> = fs::read_dir(&output_dir)
+            .expect("failed to read output directory")
+            .map(|entry| {
+                entry
+                    .expect("entry error")
+                    .file_name()
+                    .into_string()
+                    .expect("non utf8 file name")
+            })
+            .collect();
+        written_files.sort();
+        assert_eq!(
+            written_files,
+            vec![
+                "clean_p226_001.wav",
+                "clean_p226_002.wav",
+                "noisy_p226_001.wav",
+                "noisy_p226_002.wav",
+            ]
+        );
+
+        let audio_bytes = fs::read(output_dir.join("noisy_p226_001.wav")).expect("file missing");
+        assert_eq!(audio_bytes, b"RIFF0000WAVEnoisy-one");
+
+        let metadata = metadata.lock().expect("metadata mutex poisoned");
+        assert!(metadata.iter().any(|record| {
+            record.file_name == "clean_p226_001.wav"
+                && record.audio_column == "clean"
+                && record.id.as_deref() == Some("p226_001")
+                && record.transcription.is_none()
+        }));
     }
 
     #[test]
